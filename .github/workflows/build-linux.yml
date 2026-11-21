@@ -1,0 +1,44 @@
+name: build-linux-launcher
+
+on:
+  push:
+    branches: [fix/glass-custom-background]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HORIZON_TELEMETRY_URL: "off"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      HORIZON_LAUNCHER_NO_SELF_UPDATE: "1"
+    defaults:
+      run:
+        working-directory: launcher
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher
+          key: linux
+      - name: Linux libraries GPUI links to
+        run: bash "$GITHUB_WORKSPACE/tools/ci/apt_install.sh" libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev libasound2-dev
+      - name: Run launcher tests
+        run: cargo test --release --locked
+      - name: Build launcher binary
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          mkdir -p ../dist
+          tar -czf ../dist/horizon-launcher-linux-x86_64.tar.gz -C target/release horizon-launcher
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-launcher-linux-x86_64.tar.gz
+          path: dist/horizon-launcher-linux-x86_64.tar.gz
