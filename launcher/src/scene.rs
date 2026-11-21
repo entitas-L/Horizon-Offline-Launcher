@@ -864,6 +864,14 @@ impl Scene {
         }
     }
 
+    /// Clears the cached backdrop key so the next `Scene` render restores its blurred sunset to
+    /// `glass` (for example after a custom Home background is removed).
+    pub fn invalidate_backdrop(&mut self, cx: &mut Context<Self>) {
+        if self.backdrop_for.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// Makes `baked` the picture shown; the images it replaces are dropped on the next frame.
     fn install(&mut self, baked: Baked) {
         if let Some(old) = self.baked.replace(baked) {
@@ -1273,6 +1281,64 @@ impl Backdrop {
         }
     }
 
+    /// Builds a blurred backdrop from a player-chosen picture, cropped to fill a `width` ×
+    /// `height` viewport (`ObjectFit::Cover`, centred) and dimmed by `scrim` to match the veil
+    /// drawn over the picture behind the glass UI.
+    pub fn from_image(
+        image: image::RgbaImage,
+        width: f64,
+        height: f64,
+        blur: f64,
+        scrim: f64,
+        fast: bool,
+    ) -> Backdrop {
+        let px = 4.0_f64;
+        let vw = width.max(1.0);
+        let vh = height.max(1.0);
+        let w = (vw / px).ceil().max(1.0) as usize;
+        let h = (vh / px).ceil().max(1.0) as usize;
+        if image.width() == 0 || image.height() == 0 {
+            return Backdrop {
+                w,
+                h,
+                px,
+                glass: vec![[0.0; 3]; w * h],
+                float: vec![[0.0; 3]; w * h],
+                tint: None,
+            };
+        }
+        let small = image::DynamicImage::ImageRgba8(image)
+            .resize_to_fill(w as u32, h as u32, image::imageops::FilterType::Triangle)
+            .to_rgba8();
+        let keep = (1.0 - scrim).clamp(0.0, 1.0);
+        let base: Vec<[f64; 3]> = small
+            .pixels()
+            .map(|p| {
+                [
+                    p.0[0] as f64 / 255.0 * keep,
+                    p.0[1] as f64 / 255.0 * keep,
+                    p.0[2] as f64 / 255.0 * keep,
+                ]
+            })
+            .collect();
+        let blurred = |sigma: f64| -> Vec<[f32; 3]> {
+            let texels = if fast {
+                box_blur_rgb(&base, w, h, sigma / px)
+            } else {
+                gaussian_blur_rgb(&base, w, h, sigma / px)
+            };
+            texels.into_iter().map(|c| c.map(|v| v as f32)).collect()
+        };
+        Backdrop {
+            w,
+            h,
+            px,
+            glass: blurred(blur),
+            float: blurred(if blur <= 0.0 { 0.0 } else { blur + 24.0 }),
+            tint: None,
+        }
+    }
+
     /// Lays `tint` (none for the violet) over the backdrop from now on; true if it changed.
     pub fn set_tint(&mut self, tint: Option<u32>) -> bool {
         let tint = tint.map(rgb);
@@ -1607,5 +1673,45 @@ mod tests {
         for i in 0..3 {
             assert!((tint_then_blur[i] - blur_then_tint[i]).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn custom_image_backdrop_crops_to_cover_dims_and_blurs() {
+        // Wide 120×40 image: left and right thirds red, middle third blue. Fitted to a square
+        // 80×80 viewport (`ObjectFit::Cover`), only the blue middle survives.
+        let wide = image::RgbaImage::from_fn(120, 40, |x, _| {
+            if (40..80).contains(&x) {
+                image::Rgba([0, 0, 255, 255])
+            } else {
+                image::Rgba([255, 0, 0, 255])
+            }
+        });
+        let cover = Backdrop::from_image(wide, 80., 80., 0., 0., true);
+        let edge = cover.at(false, 4., 40.);
+        assert!(edge[2] > 0.9 && edge[0] < 0.1, "{edge:?}");
+
+        // Scrim dims a solid white image uniformly (saturation preserves neutral greys).
+        let white = image::RgbaImage::from_pixel(32, 32, image::Rgba([255, 255, 255, 255]));
+        let dimmed = Backdrop::from_image(white, 80., 80., 0., 0.28, true);
+        let c = dimmed.at(false, 40., 40.);
+        for ch in c {
+            assert!((ch - 0.72).abs() < 0.02, "{c:?}");
+        }
+
+        // Blur blends a sharp vertical split at the centre while keeping the far edges distinct.
+        let split = image::RgbaImage::from_fn(80, 40, |x, _| {
+            let v = if x < 40 { 0 } else { 255 };
+            image::Rgba([v, v, v, 255])
+        });
+        let blurred = Backdrop::from_image(split, 160., 80., 16., 0., true);
+        let left = blurred.at(false, 2., 40.)[0];
+        let mid = blurred.at(false, 80., 40.)[0];
+        let right = blurred.at(false, 158., 40.)[0];
+        assert!(left < 0.2 && mid > 0.3 && mid < 0.7 && right > 0.8, "{left} {mid} {right}");
+
+        // Empty images never panic.
+        let empty = image::RgbaImage::new(0, 0);
+        let zero = Backdrop::from_image(empty, 80., 80., 12., 0.28, true);
+        assert_eq!(zero.at(false, 40., 40.), [0., 0., 0.]);
     }
 }

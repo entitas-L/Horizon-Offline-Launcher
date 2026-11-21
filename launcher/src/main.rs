@@ -334,6 +334,10 @@ struct Launcher {
     restyle: bool,
     /// Why the last picture for Home's background was refused.
     background_error: Option<String>,
+    /// The `(path, width, height, blur_tenths)` the glass plates' custom background backdrop was
+    /// built for, and whether a worker thread is currently building one.
+    custom_backdrop_for: Option<(std::path::PathBuf, u32, u32, u32)>,
+    custom_backdrop_building: bool,
     /// Settings' data relocation confirmation and the worker's last result.
     location_target: Option<std::path::PathBuf>,
     location_error: Option<String>,
@@ -650,6 +654,8 @@ impl Launcher {
             // The first draw takes the launcher theme from Settings.
             restyle: true,
             background_error: None,
+            custom_backdrop_for: None,
+            custom_backdrop_building: false,
             location_target: None,
             location_error: location_page::startup_error(),
             location_note: location_page::startup_note(),
@@ -5315,6 +5321,7 @@ impl Render for Launcher {
         if std::mem::take(&mut self.restyle) {
             self.theme = self.settings_theme(window);
         }
+        let t = self.theme;
         glass_ui::set_on(self.theme.glass);
         glass_ui::set_light(!self.theme.dark);
         glass::set_light(!self.theme.dark);
@@ -5378,24 +5385,139 @@ impl Render for Launcher {
         if self.opening.is_none() && window.focused(cx).is_none() {
             window.focus(&self.root_focus, cx);
         }
-        // The glass look draws the new design's scene in the dark appearance; the light look and
-        // the blocky looks keep the baked sky. The sky is tiles that don't depend on the
-        // window's size, so a resize costs no rebake.
+        // The glass look draws the player's chosen Home background behind the whole window when
+        // one is set (and feeds a blurred copy to the dark glass plates); otherwise it draws the
+        // new design's scene in the dark appearance, while the light look and blocky looks keep
+        // the baked sky. The sky is tiles that don't depend on the window's size, so a resize
+        // costs no rebake.
         glass::begin_build(window);
-        let sky = if t.glass && t.dark {
-            self.scene.clone().into_any_element()
+        let custom_bg = if t.glass {
+            self.home_background()
         } else {
-            let (sky, next) = self.sky.render(
-                &t.night,
-                (size.width.into(), size.height.into()),
-                window.scale_factor(),
-                window.is_window_active(),
-                Instant::now(),
-            );
-            if let Some(next) = next {
-                self.wake_sky(next, cx);
+            None
+        };
+        let sky = if let Some(path) = custom_bg {
+            const DARK_SCRIM: f32 = 0.28;
+            const LIGHT_SCRIM: f32 = 0.32;
+            if t.dark {
+                self.scene
+                    .update(cx, |scene, cx| scene.invalidate_backdrop(cx));
+                let vw = f32::from(size.width);
+                let vh = f32::from(size.height);
+                if !performance && vw > 0. && vh > 0. {
+                    let wanted = (
+                        path.clone(),
+                        vw.round().max(1.) as u32,
+                        vh.round().max(1.) as u32,
+                        (blur * 10.).round().max(0.) as u32,
+                    );
+                    if !self.custom_backdrop_building
+                        && self.custom_backdrop_for.as_ref() != Some(&wanted)
+                    {
+                        self.custom_backdrop_building = true;
+                        let bg_path = path.clone();
+                        let bg_w = f64::from(vw);
+                        let bg_h = f64::from(vh);
+                        let bg_blur = f64::from(blur);
+                        let max_side = self.window_side().min(2048);
+                        cx.spawn(async move |this, cx| {
+                            let built = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    let img = horizon_launcher::pictures::load_fitted(
+                                        &bg_path, max_side,
+                                    )
+                                    .ok()?;
+                                    Some(scene::Backdrop::from_image(
+                                        img,
+                                        bg_w,
+                                        bg_h,
+                                        bg_blur,
+                                        f64::from(DARK_SCRIM),
+                                        true,
+                                    ))
+                                })
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.custom_backdrop_building = false;
+                                if let Some(backdrop) = built {
+                                    if this.theme.glass
+                                        && this.theme.dark
+                                        && this.home_background().as_ref() == Some(&wanted.0)
+                                    {
+                                        glass::set_custom_backdrop(backdrop);
+                                        this.custom_backdrop_for = Some(wanted);
+                                    }
+                                } else {
+                                    this.custom_backdrop_for = Some(wanted);
+                                }
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
+                }
+            } else {
+                self.custom_backdrop_for = None;
+                if glass::clear_custom_backdrop() {
+                    self.scene.update(cx, |scene, cx| {
+                        scene.invalidate_backdrop(cx);
+                        cx.notify();
+                    });
+                }
             }
-            sky.into_any_element()
+            let side = picture_cache::Look::Fit(self.window_side());
+            let image = self.picture(&path, side, cx);
+            let fallback: Hsla = if t.dark {
+                gpui::rgb(horizon_theme::glass::PAGE).into()
+            } else {
+                t.page
+            };
+            let scrim = if t.dark {
+                gpui::black().opacity(DARK_SCRIM)
+            } else {
+                gpui::white().opacity(LIGHT_SCRIM)
+            };
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .overflow_hidden()
+                .bg(fallback)
+                .children(image.map(|img| {
+                    gpui::img(img)
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Cover)
+                }))
+                .child(div().absolute().top_0().left_0().size_full().bg(scrim))
+                .into_any_element()
+        } else {
+            self.custom_backdrop_for = None;
+            if glass::clear_custom_backdrop() {
+                self.scene.update(cx, |scene, cx| {
+                    scene.invalidate_backdrop(cx);
+                    cx.notify();
+                });
+            }
+            if t.glass && t.dark {
+                self.scene.clone().into_any_element()
+            } else {
+                let (sky, next) = self.sky.render(
+                    &t.night,
+                    (size.width.into(), size.height.into()),
+                    window.scale_factor(),
+                    window.is_window_active(),
+                    Instant::now(),
+                );
+                if let Some(next) = next {
+                    self.wake_sky(next, cx);
+                }
+                sky.into_any_element()
+            }
         };
         // Dark: the glass frame over the scene; Light keeps the night one over the dawn.
         let (topbar, sidebar) = if t.glass {

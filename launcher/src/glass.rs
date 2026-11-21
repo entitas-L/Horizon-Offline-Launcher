@@ -34,6 +34,9 @@ type Key = (i32, i32, i32, i32, Kind, u32, u32);
 
 struct Pieces {
     backdrop: Option<Backdrop>,
+    /// True when `backdrop` comes from a player-chosen Home background picture rather than the
+    /// Horizon sunset scene: accent tinting is skipped so the photo keeps its own colours.
+    custom_backdrop: bool,
     look: Glass,
     /// Bumped when the backdrop or the look changes: older pieces are thrown away.
     generation: u32,
@@ -62,6 +65,7 @@ const LIGHT_FLOAT: f32 = 0.94;
 thread_local! {
     static PIECES: RefCell<Pieces> = RefCell::new(Pieces {
         backdrop: None,
+        custom_backdrop: false,
         look: Glass::default_look(),
         generation: 0,
         build: 0,
@@ -98,14 +102,40 @@ pub fn set_backdrop(model: &Model, tint: Option<u32>, blur: f32, fast: bool) {
         let mut backdrop = Backdrop::new(model, blur as f64, fast);
         backdrop.set_tint(tint);
         p.backdrop = Some(backdrop);
+        p.custom_backdrop = false;
         p.generation += 1;
     });
+}
+
+/// Installs a pre-built blurred backdrop for a player-chosen Home background picture.
+pub fn set_custom_backdrop(backdrop: Backdrop) {
+    PIECES.with_borrow_mut(|p| {
+        p.backdrop = Some(backdrop);
+        p.custom_backdrop = true;
+        p.generation += 1;
+    });
+}
+
+/// Marks any custom picture backdrop inactive; returns true if one was active so the caller can
+/// ask `Scene` to restore its sunset backdrop.
+pub fn clear_custom_backdrop() -> bool {
+    PIECES.with_borrow_mut(|p| {
+        if !p.custom_backdrop {
+            return false;
+        }
+        p.custom_backdrop = false;
+        p.generation += 1;
+        true
+    })
 }
 
 /// The accent's tint changed (the window and the blur did not): the backdrop is tinted as its
 /// pieces are read, so they are painted again, and nothing is blurred.
 pub fn set_backdrop_tint(tint: Option<u32>) {
     PIECES.with_borrow_mut(|p| {
+        if p.custom_backdrop {
+            return;
+        }
         if let Some(backdrop) = p.backdrop.as_mut() {
             if backdrop.set_tint(tint) {
                 p.generation += 1;
@@ -467,4 +497,28 @@ fn piece(backdrop: &Backdrop, look: &Glass, kind: Kind, key: Key) -> Arc<RenderI
         }
     }
     Arc::new(RenderImage::new([image::Frame::new(buf)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_backdrop_ignores_scene_tint_and_clears_once() {
+        let grey = image::RgbaImage::from_pixel(32, 32, image::Rgba([180, 180, 180, 255]));
+        set_custom_backdrop(Backdrop::from_image(grey, 80., 80., 0., 0., true));
+        let gen_before = PIECES.with_borrow(|p| p.generation);
+        // Changing the launcher accent must not tint a player's custom background photo.
+        set_backdrop_tint(Some(0xff0000));
+        let (gen_after, sample) = PIECES.with_borrow(|p| {
+            (
+                p.generation,
+                p.backdrop.as_ref().unwrap().at(false, 40., 40.),
+            )
+        });
+        assert_eq!(gen_before, gen_after);
+        assert!((sample[0] - sample[1]).abs() < 0.01 && (sample[1] - sample[2]).abs() < 0.01);
+        assert!(clear_custom_backdrop());
+        assert!(!clear_custom_backdrop());
+    }
 }
